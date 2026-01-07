@@ -43,7 +43,7 @@
     - **高性能**：绕过了 CDN 的 Body 限制，同时保持了原生 Stream 上传的零额外开销。
 *   **注意**：此模式下服务器作为“同步管道”，如果云端速度极慢，会通过 TCP 窗口自动限制用户上传速度。
 
-![演示图](file:///f:/code_program/OpenList-4.1.9/演示图.png)
+![原理示意图](file:///f:/code_program/OpenList-4.1.9/演示图.png)
 
 ---
 
