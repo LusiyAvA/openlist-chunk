@@ -96,3 +96,4 @@ export const calculateHash = async (file: File) => {
     sha256: "",
   }))
 }
+ 

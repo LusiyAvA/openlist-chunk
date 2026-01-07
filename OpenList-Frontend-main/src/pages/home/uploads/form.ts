@@ -337,3 +337,4 @@ export const FormUpload: Upload = async (
   console.log(`[Form Upload] ${file.name} (${fileSizeMB} MB) using direct upload`)
   return directUpload(uploadPath, file, setUpload, asTask, overwrite, rapid)
 }
+ 

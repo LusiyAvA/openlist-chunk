@@ -7,7 +7,9 @@ import (
 	"net/url"
 	"os"
 	stdpath "path"
+	"regexp"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
@@ -41,6 +43,62 @@ func shouldIgnoreSystemFile(filename string) bool {
 	return false
 }
 
+// StreamUploadSession manages a chunked stream upload session
+type StreamUploadSession struct {
+	pipeWriter *io.PipeWriter
+	pipeReader *io.PipeReader
+	totalSize  int64
+	received   int64
+	done       chan error
+	lastActive time.Time
+	mu         sync.Mutex
+}
+
+// streamUploadSessions stores active upload sessions
+var streamUploadSessions = sync.Map{}
+
+// cleanupInterval for expired sessions
+const streamSessionTimeout = 10 * time.Minute
+
+func init() {
+	// Start cleanup goroutine for expired sessions
+	go func() {
+		ticker := time.NewTicker(time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			now := time.Now()
+			streamUploadSessions.Range(func(key, value any) bool {
+				session := value.(*StreamUploadSession)
+				session.mu.Lock()
+				if now.Sub(session.lastActive) > streamSessionTimeout {
+					session.pipeWriter.CloseWithError(fmt.Errorf("session timeout"))
+					streamUploadSessions.Delete(key)
+				}
+				session.mu.Unlock()
+				return true
+			})
+		}
+	}()
+}
+
+// parseContentRange parses Content-Range header: bytes start-end/total
+func parseContentRange(header string) (start, end, total int64, err error) {
+	re := regexp.MustCompile(`bytes (\d+)-(\d+)/(\d+)`)
+	matches := re.FindStringSubmatch(header)
+	if len(matches) != 4 {
+		return 0, 0, 0, fmt.Errorf("invalid Content-Range format")
+	}
+	start, _ = strconv.ParseInt(matches[1], 10, 64)
+	end, _ = strconv.ParseInt(matches[2], 10, 64)
+	total, _ = strconv.ParseInt(matches[3], 10, 64)
+	return
+}
+
+// generateStreamSessionKey creates a unique key for the upload session
+func generateStreamSessionKey(userID uint, path string, totalSize int64) string {
+	return fmt.Sprintf("stream:%d:%s:%d", userID, path, totalSize)
+}
+
 func FsStream(c *gin.Context) {
 	defer func() {
 		if n, _ := io.ReadFull(c.Request.Body, []byte{0}); n == 1 {
@@ -48,6 +106,146 @@ func FsStream(c *gin.Context) {
 		}
 		_ = c.Request.Body.Close()
 	}()
+
+	// Check for Content-Range header (chunked upload)
+	contentRange := c.GetHeader("Content-Range")
+	if contentRange != "" {
+		fsStreamChunked(c, contentRange)
+		return
+	}
+
+	// Original logic for non-chunked upload
+	fsStreamDirect(c)
+}
+
+// fsStreamChunked handles chunked stream upload with Content-Range
+func fsStreamChunked(c *gin.Context, contentRange string) {
+	// Parse Content-Range: bytes start-end/total
+	start, _, total, err := parseContentRange(contentRange)
+	if err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
+
+	path := c.GetHeader("File-Path")
+	path, err = url.PathUnescape(path)
+	if err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
+
+	overwrite := c.GetHeader("Overwrite") != "false"
+	user := c.Request.Context().Value(conf.UserKey).(*model.User)
+	path, err = user.JoinPath(path)
+	if err != nil {
+		common.ErrorResp(c, err, 403)
+		return
+	}
+
+	dir, name := stdpath.Split(path)
+	if shouldIgnoreSystemFile(name) {
+		common.ErrorStrResp(c, errs.IgnoredSystemFile.Error(), 403)
+		return
+	}
+
+	// Generate session key
+	sessionKey := generateStreamSessionKey(user.ID, path, total)
+
+	if start == 0 {
+		// First chunk: check overwrite and create session
+		if !overwrite {
+			if res, _ := fs.Get(c.Request.Context(), path, &fs.GetArgs{NoLog: true}); res != nil {
+				common.ErrorStrResp(c, "file exists", 403)
+				return
+			}
+		}
+
+		// Create pipe for streaming
+		pr, pw := io.Pipe()
+		session := &StreamUploadSession{
+			pipeWriter: pw,
+			pipeReader: pr,
+			totalSize:  total,
+			received:   0,
+			done:       make(chan error, 1),
+			lastActive: time.Now(),
+		}
+		streamUploadSessions.Store(sessionKey, session)
+
+		// Get mimetype
+		mimetype := c.GetHeader("Content-Type")
+		if len(mimetype) == 0 || mimetype == "application/octet-stream" {
+			mimetype = utils.GetMimeType(name)
+		}
+
+		// Start upload goroutine - reads from pipe and uploads to storage
+		go func() {
+			s := &stream.FileStream{
+				Obj: &model.Object{
+					Name:     name,
+					Size:     total,
+					Modified: getLastModified(c),
+				},
+				Reader:       pr,
+				Mimetype:     mimetype,
+				WebPutAsTask: false, // Chunked upload is inherently async-safe
+			}
+			// Use background context since original request may complete
+			err := fs.PutDirectly(context.Background(), dir, s, true)
+			session.done <- err
+		}()
+	}
+
+	// Get session
+	sessionVal, ok := streamUploadSessions.Load(sessionKey)
+	if !ok {
+		common.ErrorStrResp(c, "upload session not found, please start from first chunk", 400)
+		return
+	}
+	session := sessionVal.(*StreamUploadSession)
+
+	session.mu.Lock()
+	session.lastActive = time.Now()
+	session.mu.Unlock()
+
+	// Write request body to pipe (streaming - no buffering)
+	written, err := io.Copy(session.pipeWriter, c.Request.Body)
+	if err != nil {
+		session.pipeWriter.CloseWithError(err)
+		streamUploadSessions.Delete(sessionKey)
+		common.ErrorResp(c, err, 500)
+		return
+	}
+
+	session.mu.Lock()
+	session.received += written
+	currentReceived := session.received
+	session.mu.Unlock()
+
+	// Check if this is the last chunk
+	if currentReceived >= total {
+		// Close pipe to signal completion
+		session.pipeWriter.Close()
+
+		// Wait for upload to complete
+		uploadErr := <-session.done
+		streamUploadSessions.Delete(sessionKey)
+
+		if uploadErr != nil {
+			common.ErrorResp(c, uploadErr, 500)
+			return
+		}
+	}
+
+	common.SuccessResp(c, gin.H{
+		"received": currentReceived,
+		"total":    total,
+		"complete": currentReceived >= total,
+	})
+}
+
+// fsStreamDirect handles direct (non-chunked) stream upload
+func fsStreamDirect(c *gin.Context) {
 	path := c.GetHeader("File-Path")
 	path, err := url.PathUnescape(path)
 	if err != nil {
@@ -541,4 +739,3 @@ func FsChunkMerge(c *gin.Context) {
 		"hash": hashResponse,
 	})
 }
- 
