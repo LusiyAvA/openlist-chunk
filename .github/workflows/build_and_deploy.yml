@@ -1,0 +1,131 @@
+name: Build and Release OpenList
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+jobs:
+  # ----------------------------------------------------------------
+  # 第一步：构建前端
+  # ----------------------------------------------------------------
+  build-frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install and Build Frontend
+        # 根据你提供的路径 OpenList-Frontend-main
+        working-directory: ./OpenList-Frontend-main
+        run: |
+          npm install --legacy-peer-deps
+          npm run build
+
+      - name: Sync artifacts to backend public directory
+        # 将构建好的 dist 移动到后端的 public/dist 目录
+        run: |
+          mkdir -p public/dist
+          cp -r OpenList-Frontend-main/dist/* public/dist/
+
+      - name: Upload Frontend Artifact
+        # 上传处理好的 public 目录供后续任务使用
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: public/dist/
+
+  # ----------------------------------------------------------------
+  # 第二步：构建 Windows 和 Linux 二进制文件 (Go Backend)
+  # ----------------------------------------------------------------
+  build-backend-binaries:
+    needs: build-frontend
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23' # 建议使用较新版本
+
+      - name: Install Mingw-w64 (For Windows CGO)
+        # Ubuntu 默认不支持构建 Windows CGO 程序，需要安装 mingw
+        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64
+
+      - name: Download Frontend Artifact
+        # 下载第一步构建好的前端文件
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: public/dist
+
+      - name: Build for Linux
+        run: |
+          export CGO_ENABLED=1
+          go build -o openlist-linux-amd64 -tags=jsoniter -ldflags="-s -w" .
+
+      - name: Build for Windows
+        # 使用 MinGW 进行交叉编译
+        run: |
+          export CGO_ENABLED=1
+          export CC=x86_64-w64-mingw32-gcc
+          export CXX=x86_64-w64-mingw32-g++
+          export GOOS=windows
+          export GOARCH=amd64
+          go build -o openlist-windows-amd64.exe -tags=jsoniter -ldflags="-s -w" .
+
+      - name: Upload Binaries
+        # 将编译好的 exe 和 linux 文件上传到 GitHub Action 页面供下载
+        uses: actions/upload-artifact@v4
+        with:
+          name: openlist-binaries
+          path: |
+            openlist-linux-amd64
+            openlist-windows-amd64.exe
+
+  # ----------------------------------------------------------------
+  # 第三步：构建 Docker 镜像并推送
+  # ----------------------------------------------------------------
+  build-push-docker:
+    needs: build-frontend
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download Frontend Artifact
+        # 确保 Docker 构建上下文中包含编译好的前端文件
+        # 这样 COPY ./ ./ 时会把 public/dist 也带进去
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: public/dist
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          # 这里修改为你的镜像名
+          tags: lusiya/openlist-chunk:latest
